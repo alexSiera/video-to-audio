@@ -1,6 +1,6 @@
 from flask import Flask, request, jsonify
 from moviepy.editor import VideoFileClip
-from pydub import AudioSegment
+from pydub import AudioSegment, silence
 from pydub.effects import normalize
 import os
 import tempfile
@@ -37,7 +37,9 @@ pipe = pipeline(
     tokenizer=tokenizer,
     feature_extractor=feature_extractor,
     device=device,
-    batch_size=64
+    chunk_length_s=30,
+    batch_size=64,
+    model_kwargs={"language": "ru"}
 )
 
 # Thread-safe pipeline lock
@@ -72,17 +74,55 @@ def extract_audio(video_path):
         print(f"Audio extraction failed: {e}")
         return None
 
+# def optimize_audio(audio_path):
+#     """Normalize audio with progress [[3]]"""
+#     try:
+#         audio = AudioSegment.from_file(audio_path)
+#         with tqdm(total=100, desc="Optimizing audio", ncols=100) as pbar:
+#             normalized_audio = normalize(audio)
+#             pbar.update(100)
+        
+#         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_optimized:
+#             normalized_audio.export(temp_optimized.name, format="wav")
+#             return temp_optimized.name
+#     except Exception as e:
+#         print(f"Audio optimization failed: {e}")
+#         return None
+
 def optimize_audio(audio_path):
-    """Normalize audio with progress [[3]]"""
+    """Enhanced audio preprocessing"""
     try:
         audio = AudioSegment.from_file(audio_path)
-        with tqdm(total=100, desc="Optimizing audio", ncols=100) as pbar:
-            normalized_audio = normalize(audio)
-            pbar.update(100)
         
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_optimized:
-            normalized_audio.export(temp_optimized.name, format="wav")
-            return temp_optimized.name
+        # Apply processing chain
+        with tqdm(total=100, desc="Optimizing audio", ncols=100) as pbar:
+            # Convert to mono and 16kHz first
+            audio = audio.set_frame_rate(16000).set_channels(1)
+            pbar.update(20)
+            
+            # Noise reduction
+            audio = audio.low_pass_filter(8000).high_pass_filter(200)
+            pbar.update(20)
+            
+            # Normalization with dynamic compression
+            normalized = normalize(audio, headroom=0.1)
+            pbar.update(20)
+            
+            # Silence removal
+            nonsilent = silence.detect_nonsilent(
+                normalized, 
+                # min_silence_len=500,
+                min_silence_len=800,
+                silence_thresh=-40
+            )
+            cleaned = normalized.split_to_mono()[0]
+            if nonsilent:
+                cleaned = normalized[nonsilent[0][0]:nonsilent[-1][1]]
+            pbar.update(40)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp:
+            cleaned.export(temp.name, format="wav")
+            return temp.name
     except Exception as e:
         print(f"Audio optimization failed: {e}")
         return None
@@ -91,12 +131,13 @@ def split_audio(audio_path):
     """Split audio into 30s chunks with progress [[5]]"""
     try:
         audio = AudioSegment.from_file(audio_path)
-        chunk_length_ms = 30 * 1000
+        chunk_length_ms = 60 * 1000
         chunks = []
         total_chunks = (len(audio) // chunk_length_ms) + 1
         
         with tqdm(total=total_chunks, desc="Preparing chunks", ncols=100) as pbar:
-            for i in range(0, len(audio), chunk_length_ms):
+            overlap = 1000
+            for i in range(0, len(audio), chunk_length_ms - overlap):
                 chunk = audio[i:i + chunk_length_ms]
                 chunks.append(chunk)
                 pbar.update(1)
@@ -131,19 +172,27 @@ def transcribe():
         if not chunks:
             return jsonify({"error": "Audio splitting failed"}), 500
 
-        # Parallel processing setup
-        transcription = []
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = [executor.submit(process_chunk, chunk) for chunk in chunks]
+        # Modified processing to maintain order
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            # Submit all chunks with their original indices
+            future_to_index = {
+                executor.submit(process_chunk, chunk): i
+                for i, chunk in enumerate(chunks)
+            }
             
-            # Progress bar with dynamic updates
-            with tqdm(total=len(futures), desc="Transcribing", ncols=100) as pbar:
-                for future in as_completed(futures):
-                    result = future.result()
-                    transcription.append(result)
+            # Create list to hold results in original order
+            results = [None] * len(chunks)
+            
+            with tqdm(total=len(chunks), desc="Transcribing", ncols=100) as pbar:
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    results[index] = future.result()
                     pbar.update(1)
 
-        return jsonify({"transcription": " ".join(transcription)})
+        # Combine results in original order
+        ordered_transcription = " ".join([text for text in results if text])
+
+        return jsonify({"transcription": ordered_transcription})
 
     except Exception as e:
         return jsonify({"error": f"Processing failed: {str(e)}"}), 500
@@ -155,6 +204,6 @@ def transcribe():
                     os.unlink(path)
                 except Exception as e:
                     print(f"Cleanup failed for {path}: {e}")
-
+                    
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
