@@ -131,7 +131,7 @@ def split_audio(audio_path):
     """Split audio into 30s chunks with progress [[5]]"""
     try:
         audio = AudioSegment.from_file(audio_path)
-        chunk_length_ms = 60 * 1000
+        chunk_length_ms = 30 * 1000
         chunks = []
         total_chunks = (len(audio) // chunk_length_ms) + 1
         
@@ -156,6 +156,9 @@ def transcribe():
         return jsonify({"error": "No selected file"}), 400
 
     try:
+        base_name = os.path.splitext(video_file.filename)[0]
+        result_filename = f"{base_name}_transcript.txt"
+        
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
             video_file.save(temp_video.name)
             video_path = temp_video.name
