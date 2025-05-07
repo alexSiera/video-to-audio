@@ -18,7 +18,8 @@ from threading import Lock
 app = Flask(__name__)
 
 # Load model components
-model_name = "dvislobokov/whisper-large-v3-turbo-russian"
+# model_name = "dvislobokov/whisper-large-v3-turbo-russian"
+model_name = "bond005/whisper-large-v3-ru-podlodka"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 try:
