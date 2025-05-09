@@ -3,9 +3,11 @@ torch
 torchaudio
 librosa
 numpy
-moviepy
+moviepy==1.0.3
 transformers
 scipy
 soundfile
 tqdm
-pyannote.audio
+#pyannote.audio
+nltk
+pydub

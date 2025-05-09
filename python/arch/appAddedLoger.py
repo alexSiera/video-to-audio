@@ -14,21 +14,19 @@ from transformers import (
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
-from pyannote.audio import Pipeline
-import logging
+import time  # Для замера времени выполнения [[8]]
+from datetime import datetime  # Для уникальных имен файлов
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)
 
 # Load model components
-model_name = "openai/whisper-large-v3"  # Updated model
+#model_name = "dvislobokov/whisper-large-v3-turbo-russian"
+#model_name = "bond005/whisper-large-v3-ru-podlodka"
+print(torch.cuda.is_available()) 
+print(torch.__version__)
+print(torch.version.cuda)
+model_name = "antony66/whisper-large-v3-russian"
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Load pre-trained diarization model
-diarization_pipeline = Pipeline.from_pretrained(
-    "pyannote/speaker-diarization-3.0",
-    use_auth_token="HUGGINGFACE_TOKEN"
-)
 
 try:
     feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
@@ -57,13 +55,16 @@ pipeline_lock = Lock()
 def process_chunk(chunk):
     """Process individual audio chunk with thread safety"""
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
-            chunk.export(f.name, format="wav")
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            temp_name = f.name
+            chunk.export(temp_name, format="wav")
             with pipeline_lock:
                 with torch.no_grad():
-                    return pipe(f.name)["text"]
+                    return pipe(temp_name)["text"]
+            os.unlink(temp_name)
+            return result
     except Exception as e:
-        logging.error(f"Chunk processing failed: {e}")
+        print(f"Chunk processing failed: {e}")
         return ""
 
 def extract_audio(video_path):
@@ -76,13 +77,27 @@ def extract_audio(video_path):
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
             with tqdm(total=100, desc="Extracting audio", ncols=100) as pbar:
-                audio.write_audiofile(temp_audio.name, codec='pcm_s16le', bitrate="192k", verbose=False, logger=None)
+                audio.write_audiofile(temp_audio.name, codec='pcm_s16le', verbose=False, logger=None)
                 pbar.update(100)
-            logging.info("Audio extraction completed successfully")
             return temp_audio.name
     except Exception as e:
-        logging.error(f"Audio extraction failed: {e}")
+        print(f"Audio extraction failed: {e}")
         return None
+
+# def optimize_audio(audio_path):
+#     """Normalize audio with progress [[3]]"""
+#     try:
+#         audio = AudioSegment.from_file(audio_path)
+#         with tqdm(total=100, desc="Optimizing audio", ncols=100) as pbar:
+#             normalized_audio = normalize(audio)
+#             pbar.update(100)
+        
+#         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_optimized:
+#             normalized_audio.export(temp_optimized.name, format="wav")
+#             return temp_optimized.name
+#     except Exception as e:
+#         print(f"Audio optimization failed: {e}")
+#         return None
 
 def optimize_audio(audio_path):
     """Enhanced audio preprocessing"""
@@ -96,7 +111,7 @@ def optimize_audio(audio_path):
             pbar.update(20)
             
             # Noise reduction
-            audio = audio.low_pass_filter(7000).high_pass_filter(250)
+            audio = audio.low_pass_filter(8000).high_pass_filter(200)
             pbar.update(20)
             
             # Normalization with dynamic compression
@@ -106,8 +121,9 @@ def optimize_audio(audio_path):
             # Silence removal
             nonsilent = silence.detect_nonsilent(
                 normalized, 
-                min_silence_len=300,
-                silence_thresh=-35
+                # min_silence_len=500,
+                min_silence_len=800,
+                silence_thresh=-40
             )
             cleaned = normalized.split_to_mono()[0]
             if nonsilent:
@@ -116,30 +132,9 @@ def optimize_audio(audio_path):
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp:
             cleaned.export(temp.name, format="wav")
-            logging.info("Audio optimization completed successfully")
             return temp.name
     except Exception as e:
-        logging.error(f"Audio optimization failed: {e}")
-        return None
-
-def perform_diarization(audio_path):
-    """Perform speaker diarization on optimized audio"""
-    try:
-        # Run diarization
-        diarization = diarization_pipeline(audio_path)
-        
-        # Extract speaker segments
-        speaker_segments = []
-        for turn, _, speaker in diarization.itertracks(yield_label=True):
-            speaker_segments.append({
-                "start": turn.start,
-                "end": turn.end,
-                "speaker": speaker
-            })
-        logging.info("Diarization completed successfully")
-        return speaker_segments
-    except Exception as e:
-        logging.error(f"Diarization failed: {e}")
+        print(f"Audio optimization failed: {e}")
         return None
 
 def split_audio(audio_path):
@@ -151,15 +146,14 @@ def split_audio(audio_path):
         total_chunks = (len(audio) // chunk_length_ms) + 1
         
         with tqdm(total=total_chunks, desc="Preparing chunks", ncols=100) as pbar:
-            overlap = 1500  # Increased overlap
+            overlap = 1000
             for i in range(0, len(audio), chunk_length_ms - overlap):
                 chunk = audio[i:i + chunk_length_ms]
                 chunks.append(chunk)
                 pbar.update(1)
-        logging.info("Audio splitting completed successfully")
         return chunks
     except Exception as e:
-        logging.error(f"Audio splitting failed: {e}")
+        print(f"Audio splitting failed: {e}")
         return None
 
 @app.route('/transcribe', methods=['POST'])
@@ -173,23 +167,40 @@ def transcribe():
 
     try:
         base_name = os.path.splitext(video_file.filename)[0]
-        result_filename = f"{base_name}_transcript.txt"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")  # Уникальная метка времени
+        result_filename = f"{base_name}_{timestamp}_transcript.txt"  # [[3]]
         
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
             video_file.save(temp_video.name)
             video_path = temp_video.name
 
+        # Замер времени этапов
+        timings = {}
+        # 1. Извлечение аудио
+        timings['extract_start'] = time.time()
+
         audio_path = extract_audio(video_path)
         if not audio_path:
             return jsonify({"error": "Audio extraction failed"}), 500
 
+        # 2. Оптимизация аудио
+        timings['optimize_start'] = time.time()
         optimized_audio_path = optimize_audio(audio_path)
+        timings['optimize_end'] = time.time()
         if not optimized_audio_path:
             return jsonify({"error": "Audio optimization failed"}), 500
 
+        # 3. Разделение на чанки
+        timings['split_start'] = time.time()
         chunks = split_audio(optimized_audio_path)
+        timings['split_end'] = time.time()
         if not chunks:
             return jsonify({"error": "Audio splitting failed"}), 500
+
+        # 4. Транскрипция
+        timings['transcribe_start'] = time.time()
+        total_tokens = 0
+        results = [None] * len(chunks)
 
         # Modified processing to maintain order
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
@@ -205,26 +216,36 @@ def transcribe():
             with tqdm(total=len(chunks), desc="Transcribing", ncols=100) as pbar:
                 for future in as_completed(future_to_index):
                     index = future_to_index[future]
-                    results[index] = future.result()
+                    chunk_text, chunk_tokens = future.result()
+                    results[index] = chunk_text
+                    total_tokens += chunk_tokens
                     pbar.update(1)
-
+        timings['transcribe_end'] = time.time()
         # Combine results in original order
         ordered_transcription = " ".join([text for text in results if text])
 
-        # Add speaker diarization
-        # speaker_segments = perform_diarization(optimized_audio_path)
-        # if speaker_segments:
-        #     result_with_speakers = []
-        #     for segment in speaker_segments:
-        #         result_with_speakers.append(
-        #             f"[{segment['speaker']}] {ordered_transcription}"
-        #         )
-        #     return jsonify({"transcription": "\n".join(result_with_speakers)})
-        # else:
-            return jsonify({"transcription": ordered_transcription})
+        # Сохранение результата в файл
+        try:
+            with open(result_filename, "w", encoding="utf-8") as f:
+                f.write(ordered_transcription)
+        except Exception as e:
+            return jsonify({"error": f"Ошибка записи файла: {str(e)}"}), 500
+        # Расчет метрик
+        metrics = {
+            "tokens_per_second": total_tokens / (timings['transcribe_end'] - timings['transcribe_start']) if total_tokens else 0,
+            "total_tokens": total_tokens,
+            "timings": {
+                "extract_audio": timings['extract_end'] - timings['extract_start'],
+                "optimize_audio": timings['optimize_end'] - timings['optimize_start'],
+                "split_audio": timings['split_end'] - timings['split_start'],
+                "transcribe": timings['transcribe_end'] - timings['transcribe_start'],
+                "total": timings['transcribe_end'] - timings['extract_start']
+            }
+        }
+
+        return jsonify({"transcription": ordered_transcription, "transcript_file": result_filename, **metrics})
 
     except Exception as e:
-        logging.error(f"Processing failed: {e}")
         return jsonify({"error": f"Processing failed: {str(e)}"}), 500
 
     finally:
@@ -233,7 +254,7 @@ def transcribe():
                 try:
                     os.unlink(path)
                 except Exception as e:
-                    logging.error(f"Cleanup failed for {path}: {e}")
+                    print(f"Cleanup failed for {path}: {e}")
                     
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001)
+    app.run(host='0.0.0.0', port=5000)

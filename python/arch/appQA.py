@@ -1,0 +1,209 @@
+from flask import Flask, request, jsonify
+from moviepy.editor import VideoFileClip
+from pydub import AudioSegment, silence
+from pydub.effects import normalize
+import os
+import tempfile
+import torch
+from transformers import (
+    AutoModelForSpeechSeq2Seq,
+    AutoTokenizer,
+    AutoFeatureExtractor,
+    pipeline
+)
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+import nltk
+from nltk.tokenize import sent_tokenize
+
+nltk.download('punkt', quiet=True)
+
+app = Flask(__name__)
+
+# Load model components
+model_name = "dvislobokov/whisper-large-v3-turbo-russian"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+try:
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+except Exception:
+    from transformers import WhisperFeatureExtractor
+    feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3")
+
+model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model.resize_token_embeddings(len(tokenizer))
+
+pipe = pipeline(
+    "automatic-speech-recognition",
+    model=model,
+    tokenizer=tokenizer,
+    feature_extractor=feature_extractor,
+    device=device,
+    chunk_length_s=30,
+    batch_size=64,
+    model_kwargs={"language": "ru"}
+)
+
+pipeline_lock = Lock()
+
+def process_chunk(chunk):
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            temp_name = f.name
+            chunk.export(temp_name, format="wav")
+            with pipeline_lock:
+                with torch.no_grad():
+                    return pipe(temp_name)["text"]
+    finally:
+        os.unlink(temp_name)
+
+def extract_audio(video_path):
+    try:
+        video = VideoFileClip(video_path)
+        audio = video.audio
+        if not audio:
+            return None
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            with tqdm(total=100, desc="Extracting audio", ncols=100) as pbar:
+                audio.write_audiofile(temp_audio.name, codec='pcm_s16le', verbose=False, logger=None)
+                pbar.update(100)
+            return temp_audio.name
+    except Exception as e:
+        print(f"Audio extraction failed: {e}")
+        return None
+
+def optimize_audio(audio_path):
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        audio = audio.set_frame_rate(16000).set_channels(1)
+        audio = audio.low_pass_filter(8000).high_pass_filter(200)
+        normalized = normalize(audio, headroom=0.1)
+        
+        nonsilent = silence.detect_nonsilent(
+            normalized, 
+            min_silence_len=800,
+            silence_thresh=-40
+        )
+        cleaned = normalized.split_to_mono()[0]
+        if nonsilent:
+            cleaned = normalized[nonsilent[0][0]:nonsilent[-1][1]]
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp:
+            cleaned.export(temp.name, format="wav")
+            return temp.name
+    except Exception as e:
+        print(f"Audio optimization failed: {e}")
+        return None
+
+def split_audio(audio_path):
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        chunk_length_ms = 30 * 1000
+        chunks = []
+        total_chunks = (len(audio) // chunk_length_ms) + 1
+        
+        with tqdm(total=total_chunks, desc="Preparing chunks", ncols=100) as pbar:
+            overlap = 1000
+            for i in range(0, len(audio), chunk_length_ms - overlap):
+                chunk = audio[i:i + chunk_length_ms]
+                chunks.append(chunk)
+                pbar.update(1)
+        return chunks
+    except Exception as e:
+        print(f"Audio splitting failed: {e}")
+        return None
+
+@app.route('/transcribe', methods=['POST'])
+def transcribe():
+    if 'video' not in request.files:
+        return jsonify({"error": "No video file provided"}), 400
+
+    video_file = request.files['video']
+    if video_file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+
+    video_path = audio_path = optimized_audio_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
+            video_file.save(temp_video.name)
+            video_path = temp_video.name
+
+        audio_path = extract_audio(video_path)
+        if not audio_path:
+            return jsonify({"error": "Audio extraction failed"}), 500
+
+        optimized_audio_path = optimize_audio(audio_path)
+        if not optimized_audio_path:
+            return jsonify({"error": "Audio optimization failed"}), 500
+
+        chunks = split_audio(optimized_audio_path)
+        if not chunks:
+            return jsonify({"error": "Audio splitting failed"}), 500
+
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            future_to_index = {
+                executor.submit(process_chunk, chunk): i
+                for i, chunk in enumerate(chunks)
+            }
+            
+            results = [None] * len(chunks)
+            
+            with tqdm(total=len(chunks), desc="Transcribing", ncols=100) as pbar:
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    results[index] = future.result()
+                    pbar.update(1)
+
+        ordered_transcription = " ".join([text for text in results if text])
+
+        # Process transcription into Q&A pairs
+        try:
+            sentences = sent_tokenize(ordered_transcription, language='russian')
+        except Exception as e:
+            return jsonify({"error": f"Sentence tokenization failed: {str(e)}"}), 500
+
+        qa_pairs = []
+        current_question = None
+        current_answer = []
+
+        for sent in sentences:
+            sent = sent.strip()
+            if not sent:
+                continue
+            if sent.endswith('?'):
+                if current_question is not None and current_answer:
+                    qa_pairs.append({
+                        "question": current_question,
+                        "answer": " ".join(current_answer).strip()
+                    })
+                    current_answer = []
+                current_question = sent
+            else:
+                if current_question is not None:
+                    current_answer.append(sent)
+
+        # Add the last pair
+        if current_question is not None and current_answer:
+            qa_pairs.append({
+                "question": current_question,
+                "answer": " ".join(current_answer).strip()
+            })
+
+        return jsonify(qa_pairs)
+
+    except Exception as e:
+        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+
+    finally:
+        for path in [video_path, audio_path, optimized_audio_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except:
+                    pass
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5002)
