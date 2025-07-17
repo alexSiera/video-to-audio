@@ -1,0 +1,32 @@
+[project]
+name = "interview-transcriber"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "flask>=3.0,<4",
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+    "transformers>=4.40.0",
+    "pyannote.audio>=3.1.1",
+    "sentence-transformers>=2.7.0",
+    "moviepy>=2.0.0.dev5",
+    "pydub>=0.25.1",
+    "ffmpeg-python>=0.2.0",
+    "tqdm>=4.66",
+    "nltk>=3.8.1",
+    "python-dotenv>=1.1.1",
+    "librosa>=0.11.0",
+]
+
+[tool.uv]
+package = true
+dev-dependencies = [
+    "pytest>=8",
+    "black>=24",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+serve = "interview_transcriber.app:main"

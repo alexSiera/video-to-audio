@@ -1,8 +1,4 @@
-node_modules
-uploads
 .env
-python/project4
-temp_processing*
-temp_videos*
-myenv*
-__pycache__
+.venv
+*.egg-info
+*__pycache__
