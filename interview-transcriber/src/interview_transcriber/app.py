@@ -1,245 +1,241 @@
-"""
-High-performance Flask service:
-1. Extracts audio from video
-2. Transcribes with Whisper (ru-large-v3)
-3. Scores interviewee answers
-"""
-
-from __future__ import annotations
-import librosa
-import uuid
-import logging
-import tempfile
-from pathlib import Path
-from typing import List, Dict
-
 from flask import Flask, request, jsonify
-import torch, gc
-torch.cuda.empty_cache()
-gc.collect()
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-from sentence_transformers import SentenceTransformer
+from moviepy import VideoFileClip
 from pydub import AudioSegment, silence
 from pydub.effects import normalize
-from moviepy import VideoFileClip
+import os
+import tempfile
+import torch
+from transformers import (
+    AutoModelForSpeechSeq2Seq,
+    AutoTokenizer,
+    AutoFeatureExtractor,
+    pipeline
+)
 from tqdm import tqdm
-import nltk
-from nltk.tokenize import sent_tokenize
-from dotenv import load_dotenv
-load_dotenv()
-# ------------------------------------------------------------------ #
-# Logging setup
-# ------------------------------------------------------------------ #
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("app")
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
-# ------------------------------------------------------------------ #
-# Config (можно заменить на yaml / pydantic-settings)
-# ------------------------------------------------------------------ #
-from .config import (
-    WHISPER_MODEL,
-    SEMANTIC_MODEL,
-    DEVICE,
-    SAMPLE_RATE,
-    HEADROOM_DB,
-    MIN_SILENCE_MS,
-    SILENCE_THRESH_DB,
-)
-
-# ------------------------------------------------------------------ #
-# NLTK resources
-# ------------------------------------------------------------------ #
-try:
-    nltk.data.find("tokenizers/punkt")
-except LookupError:
-    nltk.download("punkt")
-
-# ------------------------------------------------------------------ #
-# Whisper long-form pipeline
-# ------------------------------------------------------------------ #
-
-whisper_model = WhisperForConditionalGeneration.from_pretrained(
-    WHISPER_MODEL,
-    torch_dtype=torch.float16 if DEVICE.startswith("cuda") else torch.float32,
-).to(DEVICE)
-
-whisper_processor = WhisperProcessor.from_pretrained(
-    WHISPER_MODEL,
-    language="ru",
-    task="transcribe"
-)
-
-semantic_model = SentenceTransformer(SEMANTIC_MODEL, device=DEVICE)
-
-# ------------------------------------------------------------------ #
-# Utility functions
-# ------------------------------------------------------------------ #
-def transcribe_long_form(audio_path: Path) -> str:
-    """Return full transcript using Whisper’s own long-form algorithm."""
-    audio, sr = librosa.load(audio_path, sr=SAMPLE_RATE)
-    inputs = whisper_processor(
-        audio,
-        sampling_rate=SAMPLE_RATE,
-        return_tensors="pt"
-    ).input_features.to(DEVICE)
-
-    predicted_ids = whisper_model.generate(
-        inputs,
-        language="ru",
-        task="transcribe",
-        max_new_tokens=1024,
-    )
-    return whisper_processor.batch_decode(
-        predicted_ids,
-        skip_special_tokens=True
-    )[0].strip()
-
-def extract_audio(video_path: Path) -> Path:
-    """Extract mono 16 kHz WAV from video."""
-    tmp_audio = Path(tempfile.gettempdir()) / f"{uuid.uuid4().hex}.wav"
-    with VideoFileClip(str(video_path)) as clip:
-        if clip.audio is None:
-            raise ValueError("No audio stream in video")
-        clip.audio.write_audiofile(
-            str(tmp_audio),
-            codec="pcm_s16le",
-            fps=SAMPLE_RATE,
-            nbytes=2,
-            buffersize=2000,
-            logger=None,
-        )
-    log.info("Audio extracted → %s", tmp_audio)
-    return tmp_audio
-
-
-def optimize_audio(audio_path: Path) -> Path:
-    """Pre-process audio: filter, normalize, strip silence."""
-    audio = AudioSegment.from_file(audio_path).set_frame_rate(SAMPLE_RATE).set_channels(1)
-
-    # High/low-pass
-    audio = audio.low_pass_filter(8000).high_pass_filter(200)
-
-    # Normalization
-    audio = normalize(audio, headroom=HEADROOM_DB)
-
-    # Silence trimming
-    chunks = silence.detect_nonsilent(
-        audio,
-        min_silence_len=MIN_SILENCE_MS,
-        silence_thresh=audio.dBFS + SILENCE_THRESH_DB,
-    )
-    if chunks:
-        audio = audio[chunks[0][0] : chunks[-1][1]]
-
-    out_path = Path(tempfile.gettempdir()) / f"{uuid.uuid4().hex}.wav"
-    audio.export(out_path, format="wav")
-    log.info("Audio optimized → %s", out_path)
-    return out_path
-
-
-def score_answer(answer: str, keywords: List[str], model_answer_emb) -> Dict[str, float]:
-    """Compute similarity score (0-100)."""
-    if not answer:
-        return {"score": 0.0, "reason": "empty answer"}
-
-    # keyword coverage
-    kw_hit = sum(1 for kw in keywords if kw.lower() in answer.lower())
-    kw_score = (kw_hit / max(len(keywords), 1)) * 100
-
-    # semantic similarity
-    ans_emb = semantic_model.encode(answer, convert_to_tensor=True)
-    sem_score = float(torch.nn.functional.cosine_similarity(ans_emb, model_answer_emb).item()) * 100
-
-    # weighted average
-    final_score = 0.6 * sem_score + 0.4 * kw_score
-    return {"score": round(final_score, 1), "semantic": round(sem_score, 1), "keywords": round(kw_score, 1)}
-
-
-# ------------------------------------------------------------------ #
-# Flask routes
-# ------------------------------------------------------------------ #
 app = Flask(__name__)
 
+# Load model components
+# model_name = "dvislobokov/whisper-large-v3-turbo-russian"
+WHISPER_MODEL = "bond005/whisper-large-v3-ru-podlodka"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-@app.route("/transcribe", methods=["POST"])
+try:
+    feature_extractor = AutoFeatureExtractor.from_pretrained(WHISPER_MODEL)
+except Exception:
+    from transformers import WhisperFeatureExtractor
+    feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3")
+
+model = AutoModelForSpeechSeq2Seq.from_pretrained(
+    WHISPER_MODEL,
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
+    device_map="auto",
+)
+
+tokenizer = AutoTokenizer.from_pretrained(WHISPER_MODEL)
+model.resize_token_embeddings(len(tokenizer))
+
+pipe = pipeline(
+    "automatic-speech-recognition",
+    model=model,
+    tokenizer=tokenizer,
+    feature_extractor=feature_extractor,
+    device_map="auto", 
+    chunk_length_s=30,
+    batch_size=64,
+    model_kwargs={"language": "ru"}
+)
+
+# Thread-safe pipeline lock
+pipeline_lock = Lock()
+
+def process_chunk(chunk):
+    """Process chunk on GPU if possible, else CPU."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            chunk.export(f.name, format="wav")
+
+            # --- 1. try GPU first ---
+            with pipeline_lock:
+                try:
+                    return pipe(f.name)["text"]
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower():
+                        raise  # re-raise non-OOM errors
+                    print("GPU OOM → retrying on CPU")
+                    torch.cuda.empty_cache()
+
+            # --- 2. CPU fallback ---
+            pipe_cpu = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=tokenizer,
+                feature_extractor=feature_extractor,
+                device="cpu",
+                chunk_length_s=30,
+                batch_size=1,
+            )
+            return pipe_cpu(f.name)["text"]
+    except Exception as e:
+        print(f"Chunk processing failed: {e}")
+        return ""
+
+def extract_audio(video_path):
+    """Extract audio with progress indication [[1]]"""
+    try:
+        video = VideoFileClip(video_path)
+        audio = video.audio
+        if not audio:
+            return None
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            with tqdm(total=100, desc="Extracting audio", ncols=100) as pbar:
+                audio.write_audiofile(temp_audio.name, codec='pcm_s16le', logger=None)
+                pbar.update(100)
+            return temp_audio.name
+    except Exception as e:
+        print(f"Audio extraction failed: {e}")
+        return None
+
+# def optimize_audio(audio_path):
+#     """Normalize audio with progress [[3]]"""
+#     try:
+#         audio = AudioSegment.from_file(audio_path)
+#         with tqdm(total=100, desc="Optimizing audio", ncols=100) as pbar:
+#             normalized_audio = normalize(audio)
+#             pbar.update(100)
+        
+#         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_optimized:
+#             normalized_audio.export(temp_optimized.name, format="wav")
+#             return temp_optimized.name
+#     except Exception as e:
+#         print(f"Audio optimization failed: {e}")
+#         return None
+
+def optimize_audio(audio_path):
+    """Enhanced audio preprocessing"""
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        
+        # Apply processing chain
+        with tqdm(total=100, desc="Optimizing audio", ncols=100) as pbar:
+            # Convert to mono and 16kHz first
+            audio = audio.set_frame_rate(16000).set_channels(1)
+            pbar.update(20)
+            
+            # Noise reduction
+            audio = audio.low_pass_filter(8000).high_pass_filter(200)
+            pbar.update(20)
+            
+            # Normalization with dynamic compression
+            normalized = normalize(audio, headroom=0.1)
+            pbar.update(20)
+            
+            # Silence removal
+            nonsilent = silence.detect_nonsilent(
+                normalized, 
+                # min_silence_len=500,
+                min_silence_len=800,
+                silence_thresh=-40
+            )
+            cleaned = normalized.split_to_mono()[0]
+            if nonsilent:
+                cleaned = normalized[nonsilent[0][0]:nonsilent[-1][1]]
+            pbar.update(40)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp:
+            cleaned.export(temp.name, format="wav")
+            return temp.name
+    except Exception as e:
+        print(f"Audio optimization failed: {e}")
+        return None
+
+def split_audio(audio_path):
+    """Split audio into 30s chunks with progress [[5]]"""
+    try:
+        audio = AudioSegment.from_file(audio_path)
+        chunk_length_ms = 30 * 1000
+        chunks = []
+        total_chunks = (len(audio) // chunk_length_ms) + 1
+        
+        with tqdm(total=total_chunks, desc="Preparing chunks", ncols=100) as pbar:
+            overlap = 1000
+            for i in range(0, len(audio), chunk_length_ms - overlap):
+                chunk = audio[i:i + chunk_length_ms]
+                chunks.append(chunk)
+                pbar.update(1)
+        return chunks
+    except Exception as e:
+        print(f"Audio splitting failed: {e}")
+        return None
+
+@app.route('/transcribe', methods=['POST'])
 def transcribe():
-    if "video" not in request.files:
-        return jsonify(error="No video file provided"), 400
+    if 'video' not in request.files:
+        return jsonify({"error": "No video file provided"}), 400
 
-    file = request.files["video"]
-    if file.filename == "":
-        return jsonify(error="Empty filename"), 400
-
-    model_answer = request.form.get("model_answer", "")
-    keywords = [k.strip() for k in request.form.get("keywords", "").split(",") if k.strip()]
-
-    temp_files: List[Path] = []
-
-    # --- One global progress bar (0 → 100 %) ----------------------------
-    pbar = tqdm(total=100, desc="Overall", unit="%", ncols=100)
-
-    def tick(percent: int, msg: str):
-        pbar.set_description(msg)
-        pbar.update(percent - pbar.n)
-        log.info(msg)
+    video_file = request.files['video']
+    if video_file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
 
     try:
-        tick(5, "Saving uploaded video")
-        video_tmp = Path(tempfile.gettempdir()) / f"{uuid.uuid4().hex}.mp4"
-        file.save(video_tmp)
-        temp_files.append(video_tmp)
+        base_name = os.path.splitext(video_file.filename)[0]
+        result_filename = f"{base_name}_transcript.txt"
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
+            video_file.save(temp_video.name)
+            video_path = temp_video.name
 
-        tick(25, "Extracting audio")
-        audio_raw = extract_audio(video_tmp)
-        temp_files.append(audio_raw)
+        audio_path = extract_audio(video_path)
+        if not audio_path:
+            return jsonify({"error": "Audio extraction failed"}), 500
 
-        tick(45, "Optimizing audio")
-        audio_clean = optimize_audio(audio_raw)
-        temp_files.append(audio_clean)
+        optimized_audio_path = optimize_audio(audio_path)
+        if not optimized_audio_path:
+            return jsonify({"error": "Audio optimization failed"}), 500
 
-        tick(60, "Transcribing full audio")
-        full_text = transcribe_long_form(audio_clean)
+        chunks = split_audio(optimized_audio_path)
+        if not chunks:
+            return jsonify({"error": "Audio splitting failed"}), 500
 
-        tick(75, "Splitting into sentences")
-        sentences = sent_tokenize(full_text, language="russian")
-
-        model_emb = semantic_model.encode(model_answer, convert_to_tensor=True) if model_answer else None
-
-        transcript = []
-        seg_weight = 25 / max(len(sentences), 1)  # remaining 25 %
-
-        for idx, sent in enumerate(sentences, 1):
-            entry = {
-                "start": None,
-                "end": None,
-                "speaker": "interviewee",
-                "text": sent,
+        # Modified processing to maintain order
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            # Submit all chunks with their original indices
+            future_to_index = {
+                executor.submit(process_chunk, chunk): i
+                for i, chunk in enumerate(chunks)
             }
-            if model_emb is not None:
-                entry["score"] = score_answer(sent, keywords, model_emb)
-            transcript.append(entry)
-            tick(int(75 + seg_weight * idx), f"Scoring sentence {idx}/{len(sentences)}")
+            
+            # Create list to hold results in original order
+            results = [None] * len(chunks)
+            
+            with tqdm(total=len(chunks), desc="Transcribing", ncols=100) as pbar:
+                for future in as_completed(future_to_index):
+                    index = future_to_index[future]
+                    results[index] = future.result()
+                    pbar.update(1)
 
-        tick(100, "Finished")
-        return jsonify(transcript=transcript)
+        # Combine results in original order
+        ordered_transcription = " ".join([text for text in results if text])
+
+        return jsonify({"transcription": ordered_transcription})
 
     except Exception as e:
-        log.exception("Processing failed")
-        return jsonify(error=str(e)), 500
+        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
 
     finally:
-        pbar.close()
-        for path in temp_files:
-            if path.exists():
+        for path in [video_path, audio_path, optimized_audio_path]:
+            if path and os.path.exists(path):
                 try:
-                    path.unlink(missing_ok=True)
+                    os.unlink(path)
                 except Exception as e:
-                    log.warning("Failed to delete %s: %s", path, e)
+                    print(f"Cleanup failed for {path}: {e}")
+                    
+def main():
+    app.run(host="0.0.0.0", port=5000)
 
-
-def main() -> None:
-    """Entry-point for `uv run serve`"""
-    app.run(host="0.0.0.0", port=5000, debug=False)
+if __name__ == "__main__":
+    main()
