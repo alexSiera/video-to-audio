@@ -4,7 +4,7 @@ from pydub import AudioSegment, silence
 from pydub.effects import normalize
 import os
 import tempfile
-import torch
+import torch, torchvision, sys
 from transformers import (
     AutoModelForSpeechSeq2Seq,
     AutoTokenizer,
@@ -14,28 +14,38 @@ from transformers import (
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
+import tempfile, os
+
+if os.name == "nt":                       
+    CUSTOM_TEMP = r"C:\Users\fa1nt\Documents\GitHubLearn\video-to-audio\temp"
+else:                                     
+    CUSTOM_TEMP = os.path.join(tempfile.gettempdir(), "whisper_tmp")
+
+os.makedirs(CUSTOM_TEMP, exist_ok=True)
 
 app = Flask(__name__)
 
+os.environ["TMP"] = os.environ["TEMP"] = tempfile.mkdtemp(prefix="whisper_tmp_")
+
 # Load model components
-# model_name = "dvislobokov/whisper-large-v3-turbo-russian"
-WHISPER_MODEL = "bond005/whisper-large-v3-ru-podlodka"
+model_name = "dvislobokov/whisper-large-v3-turbo-russian"
+#model_name = "bond005/whisper-large-v3-ru-podlodka"
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+if device == "cpu":
+    sys.exit("CUDA not available. Exiting.")
+
+BATCH_SIZE = 64 if device == "cuda" else 4
+
 try:
-    feature_extractor = AutoFeatureExtractor.from_pretrained(WHISPER_MODEL)
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
 except Exception:
     from transformers import WhisperFeatureExtractor
     feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-large-v3")
 
-model = AutoModelForSpeechSeq2Seq.from_pretrained(
-    WHISPER_MODEL,
-    torch_dtype=torch.float16,
-    low_cpu_mem_usage=True,
-    device_map="auto",
-)
-
-tokenizer = AutoTokenizer.from_pretrained(WHISPER_MODEL)
+model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 model.resize_token_embeddings(len(tokenizer))
 
 pipe = pipeline(
@@ -43,9 +53,9 @@ pipe = pipeline(
     model=model,
     tokenizer=tokenizer,
     feature_extractor=feature_extractor,
-    device_map="auto", 
+    device=device,
     chunk_length_s=30,
-    batch_size=64,
+    batch_size=BATCH_SIZE,
     model_kwargs={"language": "ru"}
 )
 
@@ -53,32 +63,25 @@ pipe = pipeline(
 pipeline_lock = Lock()
 
 def process_chunk(chunk):
-    """Process chunk on GPU if possible, else CPU."""
+    """Process individual audio chunk with thread safety"""
     try:
-        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+        # 1. Export to a real file that we close ourselves
+        with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=".wav",
+                delete=False,          # we delete it ourselves
+                dir=CUSTOM_TEMP) as f:
             chunk.export(f.name, format="wav")
+            tmp_name = f.name        # keep the name before we leave the block
 
-            # --- 1. try GPU first ---
-            with pipeline_lock:
-                try:
-                    return pipe(f.name)["text"]
-                except RuntimeError as e:
-                    if "out of memory" not in str(e).lower():
-                        raise  # re-raise non-OOM errors
-                    print("GPU OOM → retrying on CPU")
-                    torch.cuda.empty_cache()
+        # 2. File is now closed; Windows has no open handle → no PermissionError
+        with pipeline_lock, torch.no_grad():
+            text = pipe(tmp_name)["text"]
 
-            # --- 2. CPU fallback ---
-            pipe_cpu = pipeline(
-                "automatic-speech-recognition",
-                model=model,
-                tokenizer=tokenizer,
-                feature_extractor=feature_extractor,
-                device="cpu",
-                chunk_length_s=30,
-                batch_size=1,
-            )
-            return pipe_cpu(f.name)["text"]
+        # 3. Clean up
+        os.unlink(tmp_name)
+        return text
+
     except Exception as e:
         print(f"Chunk processing failed: {e}")
         return ""
@@ -227,15 +230,16 @@ def transcribe():
         return jsonify({"error": f"Processing failed: {str(e)}"}), 500
 
     finally:
-        for path in [video_path, audio_path, optimized_audio_path]:
+        for path in [video_path, audio_path] + ([optimized_audio_path] if 'optimized_audio_path' in locals() else []):
             if path and os.path.exists(path):
                 try:
                     os.unlink(path)
                 except Exception as e:
                     print(f"Cleanup failed for {path}: {e}")
                     
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+
+# Entry-point wrapper
 def main():
     app.run(host="0.0.0.0", port=5000)
-
-if __name__ == "__main__":
-    main()
