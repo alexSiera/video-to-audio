@@ -15,6 +15,8 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 import tempfile, os
+from optimum.onnxruntime import ORTModelForSpeechSeq2Seq
+from optimum.onnxruntime import ORTConfig
 
 if os.name == "nt":                       
     CUSTOM_TEMP = r"C:\Users\fa1nt\Documents\GitHubLearn\video-to-audio\temp"
@@ -28,8 +30,11 @@ app = Flask(__name__)
 os.environ["TMP"] = os.environ["TEMP"] = tempfile.mkdtemp(prefix="whisper_tmp_")
 
 # Load model components
-model_name = "dvislobokov/whisper-large-v3-turbo-russian"
+#model_name = "dvislobokov/whisper-large-v3-turbo-russian"
 #model_name = "bond005/whisper-large-v3-ru-podlodka"
+#model_name = "antony66/whisper-large-v3-russian"
+#model_name = "openai/whisper-large-v3"
+model_name = "dvislobokov/faster-whisper-large-v3-turbo-russian"
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -46,18 +51,43 @@ except Exception:
 
 model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
-model.resize_token_embeddings(len(tokenizer))
-
-pipe = pipeline(
-    "automatic-speech-recognition",
-    model=model,
-    tokenizer=tokenizer,
-    feature_extractor=feature_extractor,
-    device=device,
-    chunk_length_s=30,
-    batch_size=BATCH_SIZE,
-    model_kwargs={"language": "ru"}
-)
+# Замена загрузки модели на версию с поддержкой ONNX
+if "ONNX_ENABLED" in os.environ:
+    app.logger.info("Using ONNX Runtime for model acceleration")
+    # Создайте оптимизированную ONNX версию (один раз)
+    if not os.path.exists("onnx_model"):
+        app.logger.info("Converting model to ONNX format (this may take a few minutes)...")
+        ort_config = ORTConfig.from_pretrained(model_name)
+        ORTModelForSpeechSeq2Seq.from_pretrained(model_name).save_pretrained("onnx_model", ort_config=ort_config)
+        app.logger.info("ONNX model conversion completed")
+    
+    # Загрузите оптимизированную модель
+    model = ORTModelForSpeechSeq2Seq.from_pretrained("onnx_model", device=device)
+    
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=tokenizer,
+        feature_extractor=feature_extractor,
+        batch_size=BATCH_SIZE,
+        # ONNX-специфичные параметры
+        provider="CUDAExecutionProvider" if device == "cuda" else "CPUExecutionProvider"
+    )
+else:
+    app.logger.info("Using standard PyTorch model")
+    # Стандартная загрузка
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(model_name).to(device)
+    model.resize_token_embeddings(len(tokenizer))
+    pipe = pipeline(
+        "automatic-speech-recognition",
+        model=model,
+        tokenizer=tokenizer,
+        feature_extractor=feature_extractor,
+        device=device,
+        chunk_length_s=30,
+        batch_size=BATCH_SIZE,
+        model_kwargs={"language": "ru"}
+    )
 
 # Thread-safe pipeline lock
 pipeline_lock = Lock()
@@ -236,7 +266,73 @@ def transcribe():
                     os.unlink(path)
                 except Exception as e:
                     print(f"Cleanup failed for {path}: {e}")
-                    
+
+
+@app.route('/upload_audio', methods=['POST'])
+def upload_audio():
+    """
+    Принимает аудио-файл, возвращает транскрипцию.
+    Ключ поля формы: audio
+    Поддерживаемые форматы: wav, mp3, ogg, m4a, flac, …
+    """
+    if 'audio' not in request.files:
+        return jsonify({"error": "No audio file provided"}), 400
+
+    audio_file = request.files['audio']
+    if audio_file.filename == '':
+        return jsonify({"error": "Empty file name"}), 400
+
+    try:
+        # 1. Сохраняем загруженный аудио-файл
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            dir=CUSTOM_TEMP,
+            suffix=os.path.splitext(audio_file.filename)[1] or '.wav'
+        ) as tmp_audio:
+            audio_file.save(tmp_audio.name)
+            original_path = tmp_audio.name
+
+        # 2. Оптимизируем аудио
+        optimized_audio_path = optimize_audio(original_path)
+        if not optimized_audio_path:
+            return jsonify({"error": "Audio optimization failed"}), 500
+
+        # 3. Разбиваем на чанки
+        chunks = split_audio(optimized_audio_path)
+        if not chunks:
+            return jsonify({"error": "Audio splitting failed"}), 500
+
+        # 4. Транскрибируем (порядок сохраняем)
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            future_to_index = {
+                executor.submit(process_chunk, chunk): i
+                for i, chunk in enumerate(chunks)
+            }
+            results = [None] * len(chunks)
+
+            with tqdm(total=len(chunks), desc="Transcribing", ncols=100) as pbar:
+                for future in as_completed(future_to_index):
+                    idx = future_to_index[future]
+                    results[idx] = future.result()
+                    pbar.update(1)
+
+        transcription = " ".join(t for t in results if t)
+
+        return jsonify({"transcription": transcription})
+
+    except Exception as e:
+        return jsonify({"error": f"Processing failed: {str(e)}"}), 500
+
+    finally:
+        # Удаляем все временные файлы
+        for path in (original_path, optimized_audio_path) if 'optimized_audio_path' in locals() else (original_path,):
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception as e:
+                    print(f"Cleanup failed for {path}: {e}")
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
 
