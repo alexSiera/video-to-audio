@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Whisper Transcriber</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f5f5f5; padding: 2rem; }
+        .container { max-width: 800px; margin: 0 auto; background: white; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.1); padding: 2rem; }
+        h1 { text-align: center; margin-bottom: 1.5rem; color: #333; }
+        .upload-area { border: 2px dashed #ccc; border-radius: 8px; padding: 2rem; text-align: center; cursor: pointer; transition: all 0.2s; }
+        .upload-area:hover { border-color: #666; background: #fafafa; }
+        .upload-area.dragover { border-color: #4CAF50; background: #f0fff0; }
+        input[type="file"] { display: none; }
+        button { background: #4CAF50; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 6px; font-size: 1rem; cursor: pointer; width: 100%; margin-top: 1rem; }
+        button:hover { background: #45a049; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        #status { margin-top: 1rem; padding: 1rem; background: #f9f9f9; border-radius: 6px; display: none; }
+        #result { margin-top: 1rem; }
+        #result pre { background: #f9f9f9; padding: 1rem; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; }
+        .segments { margin-top: 1rem; }
+        .segment { padding: 0.5rem; border-bottom: 1px solid #eee; font-size: 0.9rem; }
+        .segment .time { color: #888; font-size: 0.8rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Whisper Transcriber</h1>
+        <div class="upload-area" id="dropZone">
+            <p>Перетащите аудиофайл сюда или нажмите для выбора</p>
+            <input type="file" id="fileInput" accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac,.webm,.mp4">
+        </div>
+        <button id="uploadBtn" disabled>Транскрибировать</button>
+        <div id="status"></div>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        const dropZone = document.getElementById('dropZone');
+        const fileInput = document.getElementById('fileInput');
+        const uploadBtn = document.getElementById('uploadBtn');
+        const status = document.getElementById('status');
+        const result = document.getElementById('result');
+        let selectedFile = null;
+
+        dropZone.addEventListener('click', () => fileInput.click());
+        dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('dragover'); });
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+        dropZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dropZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length) {
+                selectedFile = e.dataTransfer.files[0];
+                updateUI();
+            }
+        });
+        fileInput.addEventListener('change', () => {
+            if (fileInput.files.length) {
+                selectedFile = fileInput.files[0];
+                updateUI();
+            }
+        });
+
+        function updateUI() {
+            if (selectedFile) {
+                dropZone.innerHTML = `<p>${selectedFile.name}</p>`;
+                uploadBtn.disabled = false;
+            }
+        }
+
+        uploadBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+            uploadBtn.disabled = true;
+            status.style.display = 'block';
+            status.textContent = 'Загрузка и транскрибация...';
+            result.innerHTML = '';
+
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+
+            try {
+                const res = await fetch('/transcribe', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (!res.ok) {
+                    status.textContent = `Ошибка: ${data.detail || 'Неизвестная ошибка'}`;
+                    uploadBtn.disabled = false;
+                    return;
+                }
+                status.textContent = 'Готово!';
+                result.innerHTML = `<h3>Текст:</h3><pre>${data.text}</pre>`;
+                if (data.segments && data.segments.length) {
+                    let segHtml = '<div class="segments"><h3>Сегменты:</h3>';
+                    for (const seg of data.segments) {
+                        segHtml += `<div class="segment"><span class="time">[${seg.start.toFixed(1)}s - ${seg.end.toFixed(1)}s]</span> ${seg.text}</div>`;
+                    }
+                    segHtml += '</div>';
+                    result.innerHTML += segHtml;
+                }
+            } catch (e) {
+                status.textContent = `Ошибка сети: ${e.message}`;
+            }
+            uploadBtn.disabled = false;
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+[project]
+name = "whisper-transcriber"
+version = "0.1.0"
+description = "FastAPI backend for audio transcription using Whisper"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "openai-whisper>=20231117",
+    "python-multipart>=0.0.6",
+]
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
