@@ -166,31 +166,18 @@ async def transcribe_audio(file_path: str) -> dict[str, Any]:
     chunks = await split_audio(file_path)
     total_chunks = len(chunks)
 
+    all_segments: list[dict[str, Any]] = []
+    full_text_parts: list[str] = []
+
     for i, (cp, off) in enumerate(chunks):
         transcribe_chunk._idx = i + 1
         transcribe_chunk._total = total_chunks
+        result = await transcribe_chunk_async(cp, off)
+        all_segments.extend(result["segments"])
+        full_text_parts.append(result["text"])
 
-    tasks = [transcribe_chunk_async(cp, off) for cp, off in chunks]
-    results = await asyncio.gather(*tasks)
-
-    all_segments: list[dict[str, Any]] = []
-    for r in results:
-        all_segments.extend(r["segments"])
-
-    all_segments.sort(key=lambda s: s["start"])
-
-    deduped: list[dict[str, Any]] = []
-    for seg in all_segments:
-        if not deduped:
-            deduped.append(seg)
-            continue
-        last = deduped[-1]
-        if seg["start"] >= last["end"]:
-            deduped.append(seg)
-        elif len(seg["text"]) > len(last["text"]):
-            deduped[-1] = seg
-
-    full_text = " ".join(s["text"] for s in deduped)
+    deduped = _dedup_segments(all_segments)
+    full_text = " ".join(full_text_parts)
 
     for cp, _ in chunks:
         if cp != file_path:
@@ -212,6 +199,64 @@ async def transcribe_audio(file_path: str) -> dict[str, Any]:
     )
 
     return {"text": full_text, "segments": deduped}
+
+
+async def transcribe_audio_stream(file_path: str):
+    t0 = time.perf_counter()
+    log_metrics(logging.INFO, "transcribe_audio_stream", "Начало стриминг-транскрипции")
+
+    chunks = await split_audio(file_path)
+    total_chunks = len(chunks)
+
+    all_segments: list[dict[str, Any]] = []
+
+    for i, (cp, off) in enumerate(chunks):
+        transcribe_chunk._idx = i + 1
+        transcribe_chunk._total = total_chunks
+        result = await transcribe_chunk_async(cp, off)
+        all_segments.extend(result["segments"])
+
+        yield {
+            "chunk": i + 1,
+            "total": total_chunks,
+            "text": result["text"],
+            "segments": result["segments"],
+        }
+
+    deduped = _dedup_segments(all_segments)
+
+    for cp, _ in chunks:
+        if cp != file_path:
+            try:
+                os.remove(cp)
+                os.rmdir(os.path.dirname(cp))
+            except OSError:
+                pass
+
+    elapsed = time.perf_counter() - t0
+    log_metrics(
+        logging.INFO, "transcribe_audio_stream",
+        "Стриминг-транскрипция завершена",
+        duration_sec=round(elapsed, 2),
+        segments=len(deduped), chunks=total_chunks,
+    )
+
+    yield {"chunk": total_chunks, "total": total_chunks, "done": True, "segments": deduped}
+
+
+def _dedup_segments(all_segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    all_segments.sort(key=lambda s: s["start"])
+    deduped: list[dict[str, Any]] = []
+    for seg in all_segments:
+        if not deduped:
+            deduped.append(seg)
+            continue
+        last = deduped[-1]
+        if seg["start"] >= last["end"]:
+            deduped.append(seg)
+        elif len(seg["text"]) > len(last["text"]):
+            deduped[-1] = seg
+    return deduped
 
 
 async def transcribe_chunk_async(chunk_path: str, offset: float) -> dict[str, Any]:

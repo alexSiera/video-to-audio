@@ -6,10 +6,12 @@ from typing import AsyncGenerator
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
+
+import json
 
 from .logger import log_metrics, logger
-from .whisper_utils import load_model_async, transcribe_audio
+from .whisper_utils import load_model_async, transcribe_audio, transcribe_audio_stream
 import logging
 
 MAX_FILE_SIZE = 500 * 1024 * 1024
@@ -97,6 +99,64 @@ async def transcribe(file: UploadFile = File(...)) -> dict:
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+async def _save_upload(file: UploadFile) -> tuple[str, str]:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format: {ext}. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+        )
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp_path = tmp.name
+        file_size = 0
+        CHUNK_SIZE = 1024 * 1024
+        while chunk := await file.read(CHUNK_SIZE):
+            file_size += len(chunk)
+            if file_size > MAX_FILE_SIZE:
+                os.remove(tmp_path)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Max: {MAX_FILE_SIZE} bytes",
+                )
+            tmp.write(chunk)
+    return tmp_path, ext
+
+
+@app.post("/transcribe/stream")
+async def transcribe_stream(file: UploadFile = File(...)) -> StreamingResponse:
+    tmp_path, ext = await _save_upload(file)
+
+    log_metrics(
+        logging.INFO, "receive_file",
+        f"Получен файл: {file.filename}",
+        file_name=file.filename, file_ext=ext,
+    )
+
+    async def event_generator():
+        try:
+            async for chunk_data in transcribe_audio_stream(tmp_path):
+                yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+        finally:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
