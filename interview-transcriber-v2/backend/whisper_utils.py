@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+import torch
 import whisper
 
 from .logger import log_metrics, logger
@@ -14,21 +15,31 @@ import logging
 _model: Any = None
 _executor = ThreadPoolExecutor(max_workers=1)
 
-CHUNK_DURATION = 28
+CHUNK_DURATION = 30
 OVERLAP = 2
 
 
 def load_model() -> Any:
     global _model
     model_name = os.environ.get("WHISPER_MODEL", "large-v3")
-    log_metrics(logging.INFO, "model_load", f"Загрузка модели {model_name}...")
+    device = os.environ.get("WHISPER_DEVICE", "auto")
+    compute_type = os.environ.get("WHISPER_COMPUTE_TYPE", "float16")
+    if device == "auto":
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            device = "cpu"
+        else:
+            device = "cpu"
+    log_metrics(logging.INFO, "model_load", f"Загрузка модели {model_name} (device={device}, compute={compute_type})...")
     t0 = time.perf_counter()
-    _model = whisper.load_model(model_name)
+    _model = whisper.load_model(model_name, device=device)
     elapsed = time.perf_counter() - t0
     log_metrics(
         logging.INFO, "model_load",
         f"Модель {model_name} загружена",
-        model=model_name, duration_sec=round(elapsed, 2),
+        model=model_name, device=device, compute_type=compute_type,
+        duration_sec=round(elapsed, 2),
     )
     return _model
 
@@ -123,7 +134,7 @@ async def split_audio(file_path: str) -> list[tuple[str, float]]:
         cmd = [
             "ffmpeg", "-y", "-i", file_path,
             "-ss", str(offset),
-            "-t", str(CHUNK_DURATION),
+            "-t", str(CHUNK_DURATION + OVERLAP),
             "-ar", "16000", "-ac", "1",
             "-f", "wav",
             chunk_path,
@@ -167,7 +178,19 @@ async def transcribe_audio(file_path: str) -> dict[str, Any]:
         all_segments.extend(r["segments"])
 
     all_segments.sort(key=lambda s: s["start"])
-    full_text = " ".join(s["text"] for s in all_segments)
+
+    deduped: list[dict[str, Any]] = []
+    for seg in all_segments:
+        if not deduped:
+            deduped.append(seg)
+            continue
+        last = deduped[-1]
+        if seg["start"] >= last["end"]:
+            deduped.append(seg)
+        elif len(seg["text"]) > len(last["text"]):
+            deduped[-1] = seg
+
+    full_text = " ".join(s["text"] for s in deduped)
 
     for cp, _ in chunks:
         if cp != file_path:
@@ -177,18 +200,18 @@ async def transcribe_audio(file_path: str) -> dict[str, Any]:
             except OSError:
                 pass
 
-    total_words = sum(len(s["text"].split()) for s in all_segments)
+    total_words = sum(len(s["text"].split()) for s in deduped)
     elapsed = time.perf_counter() - t0
 
     log_metrics(
         logging.INFO, "transcribe_audio",
         "Транскрипция завершена",
         duration_sec=round(elapsed, 2),
-        segments=len(all_segments), words=total_words,
+        segments=len(deduped), words=total_words,
         chunks=total_chunks,
     )
 
-    return {"text": full_text, "segments": all_segments}
+    return {"text": full_text, "segments": deduped}
 
 
 async def transcribe_chunk_async(chunk_path: str, offset: float) -> dict[str, Any]:

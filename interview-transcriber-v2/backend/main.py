@@ -15,6 +15,8 @@ import logging
 MAX_FILE_SIZE = 500 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".mp3", ".wav", ".m4a", ".ogg", ".flac", ".webm", ".mp4"}
 
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "http://localhost:3000,http://localhost:8000").split(",")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
@@ -29,7 +31,7 @@ app = FastAPI(title="Whisper Transcriber", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,23 +57,26 @@ async def transcribe(file: UploadFile = File(...)) -> dict:
             detail=f"Unsupported format: {ext}. Allowed: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
 
-    content = await file.read()
-    file_size_mb = round(len(content) / (1024 * 1024), 2)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        tmp_path = tmp.name
+        file_size = 0
+        CHUNK_SIZE = 1024 * 1024
+        while chunk := await file.read(CHUNK_SIZE):
+            file_size += len(chunk)
+            if file_size > MAX_FILE_SIZE:
+                os.remove(tmp_path)
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Max: {MAX_FILE_SIZE} bytes",
+                )
+            tmp.write(chunk)
+
+    file_size_mb = round(file_size / (1024 * 1024), 2)
     log_metrics(
         logging.INFO, "receive_file",
         f"Получен файл: {file.filename}",
         file_name=file.filename, file_ext=ext, file_size=f"{file_size_mb} MB",
     )
-
-    if len(content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large: {len(content)} bytes. Max: {MAX_FILE_SIZE} bytes",
-        )
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(content)
-        tmp_path = tmp.name
 
     try:
         result = await transcribe_audio(tmp_path)
