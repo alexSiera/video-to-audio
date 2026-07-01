@@ -19,11 +19,17 @@
         #status { margin-top: 1rem; padding: 1rem; background: #f9f9f9; border-radius: 6px; display: none; }
         #progress { margin-top: 0.5rem; font-size: 0.9rem; color: #666; }
         #result { margin-top: 1rem; }
-        #result pre { background: #f9f9f9; padding: 1rem; border-radius: 6px; white-space: pre-wrap; word-wrap: break-word; max-height: 400px; overflow-y: auto; }
+        #transcript { background: #f9f9f9; padding: 1rem; border-radius: 6px; min-height: 100px; max-height: 500px; overflow-y: auto; line-height: 1.8; font-size: 1rem; }
+        #transcript:empty::before { content: ''; }
+        .word { display: inline; opacity: 0; animation: fadeIn 0.15s ease forwards; }
+        @keyframes fadeIn { to { opacity: 1; } }
+        .skeleton-line { display: flex; gap: 6px; margin-top: 0.5rem; }
+        .skeleton-word { height: 1em; background: linear-gradient(90deg, #e0e0e0 25%, #f0f0f0 50%, #e0e0e0 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 4px; }
+        @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
         .segments { margin-top: 1rem; }
         .segment { padding: 0.5rem; border-bottom: 1px solid #eee; font-size: 0.9rem; }
         .segment .time { color: #888; font-size: 0.8rem; }
-        .chunk-indicator { display: inline-block; background: #e8f5e9; color: #2e7d32; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; margin-left: 0.5rem; }
+        .word-timestamp { color: #999; font-size: 0.75rem; margin-right: 0.25rem; }
     </style>
 </head>
 <body>
@@ -36,7 +42,9 @@
         <button id="uploadBtn" disabled>Транскрибировать</button>
         <div id="status"></div>
         <div id="progress"></div>
-        <div id="result"></div>
+        <div id="result">
+            <div id="transcript"></div>
+        </div>
     </div>
 
     <script>
@@ -45,7 +53,7 @@
         const uploadBtn = document.getElementById('uploadBtn');
         const status = document.getElementById('status');
         const progress = document.getElementById('progress');
-        const result = document.getElementById('result');
+        const transcript = document.getElementById('transcript');
         let selectedFile = null;
 
         dropZone.addEventListener('click', () => fileInput.click());
@@ -73,13 +81,45 @@
             }
         }
 
+        function showSkeleton() {
+            const skeleton = document.createElement('div');
+            skeleton.className = 'skeleton-line';
+            skeleton.id = 'skeleton';
+            for (let i = 0; i < 5; i++) {
+                const w = document.createElement('div');
+                w.className = 'skeleton-word';
+                w.style.width = `${30 + Math.random() * 50}px`;
+                skeleton.appendChild(w);
+            }
+            transcript.appendChild(skeleton);
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
+        function removeSkeleton() {
+            const s = document.getElementById('skeleton');
+            if (s) s.remove();
+        }
+
+        function appendWords(words) {
+            removeSkeleton();
+            const frag = document.createDocumentFragment();
+            for (const w of words) {
+                const span = document.createElement('span');
+                span.className = 'word';
+                span.textContent = w.word + ' ';
+                frag.appendChild(span);
+            }
+            transcript.appendChild(frag);
+            transcript.scrollTop = transcript.scrollHeight;
+        }
+
         uploadBtn.addEventListener('click', async () => {
             if (!selectedFile) return;
             uploadBtn.disabled = true;
             status.style.display = 'block';
             status.textContent = 'Загрузка файла...';
             progress.textContent = '';
-            result.innerHTML = '';
+            transcript.innerHTML = '';
 
             const formData = new FormData();
             formData.append('file', selectedFile);
@@ -94,10 +134,11 @@
                 }
 
                 status.textContent = 'Транскрибация...';
+                showSkeleton();
+
                 const reader = res.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '';
-                let allSegments = [];
 
                 while (true) {
                     const { done, value } = await reader.read();
@@ -116,12 +157,14 @@
                             const data = JSON.parse(jsonStr);
 
                             if (data.error) {
+                                removeSkeleton();
                                 status.textContent = `Ошибка: ${data.error}`;
                                 uploadBtn.disabled = false;
                                 return;
                             }
 
-                            if (data.done) {
+                            if (data.type === 'done') {
+                                removeSkeleton();
                                 status.textContent = 'Готово!';
                                 progress.textContent = '';
                                 renderFinalResult(data.segments);
@@ -129,11 +172,12 @@
                                 return;
                             }
 
-                            progress.innerHTML = `Чанк <strong>${data.chunk}</strong> из <strong>${data.total}</strong>`;
-
-                            if (data.segments && data.segments.length) {
-                                allSegments.push(...data.segments);
-                                renderStreamingSegments(allSegments);
+                            if (data.type === 'chunk') {
+                                progress.innerHTML = `Чанк <strong>${data.chunk}</strong> из <strong>${data.total}</strong>`;
+                                if (data.words && data.words.length) {
+                                    appendWords(data.words);
+                                    showSkeleton();
+                                }
                             }
                         } catch (e) {
                             // skip malformed JSON
@@ -141,33 +185,23 @@
                     }
                 }
             } catch (e) {
+                removeSkeleton();
                 status.textContent = `Ошибка сети: ${e.message}`;
             }
             uploadBtn.disabled = false;
         });
 
-        function renderStreamingSegments(segments) {
-            let html = '<div class="segments"><h3>Сегменты:</h3>';
-            for (const seg of segments) {
-                html += `<div class="segment"><span class="time">[${seg.start.toFixed(1)}s - ${seg.end.toFixed(1)}s]</span> ${seg.text}</div>`;
-            }
-            html += '</div>';
-            result.innerHTML = html;
-
-            const pre = result.querySelector('.segments');
-            if (pre) pre.scrollTop = pre.scrollHeight;
-        }
-
         function renderFinalResult(segments) {
+            transcript.innerHTML = '';
             if (!segments || !segments.length) return;
-            const fullText = segments.map(s => s.text).join(' ');
-            let html = `<h3>Текст:</h3><pre>${fullText}</pre>`;
-            html += '<div class="segments"><h3>Сегменты:</h3>';
+            const frag = document.createDocumentFragment();
             for (const seg of segments) {
-                html += `<div class="segment"><span class="time">[${seg.start.toFixed(1)}s - ${seg.end.toFixed(1)}s]</span> ${seg.text}</div>`;
+                const div = document.createElement('div');
+                div.className = 'segment';
+                div.innerHTML = `<span class="word-timestamp">[${seg.start.toFixed(1)}s]</span> ${seg.text}`;
+                frag.appendChild(div);
             }
-            html += '</div>';
-            result.innerHTML = html;
+            transcript.appendChild(frag);
         }
     </script>
 </body>
