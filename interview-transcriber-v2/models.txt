@@ -1,0 +1,5 @@
+#model_name = "dvislobokov/whisper-large-v3-turbo-russian"
+#model_name = "bond005/whisper-large-v3-ru-podlodka"
+#model_name = "antony66/whisper-large-v3-russian"
+#model_name = "openai/whisper-large-v3"
+model_name = "dvislobokov/faster-whisper-large-v3-turbo-russian"
