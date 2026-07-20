@@ -1,0 +1,22 @@
+{
+  "name": "interview-transcriber-v3",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SaaS для транскрибации длинных интервью (RU primary + EN). Монорепозиторий.",
+  "packageManager": "pnpm@10.33.2",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter=./apps/web... build",
+    "dev": "pnpm --filter ./apps/web dev",
+    "lint": "pnpm -r run lint",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "clean": "pnpm -r exec rm -rf dist .turbo node_modules/.cache"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.3",
+    "typescript": "^5.6.3"
+  }
+}
